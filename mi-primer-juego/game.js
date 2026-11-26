@@ -9,6 +9,7 @@ const SCEN_LEN = 25;          // cada 25 puntos cambia el escenario
 const WIN_SCORE = 100;        // al llegar aquí encuentra a su familia
 const SAVE_KEY = 'luna_huesitos_total';
 const SKIN_KEY = 'luna_skins';
+const SETTINGS_KEY = 'luna_settings';
 
 const config = {
   type: Phaser.AUTO,
@@ -28,6 +29,7 @@ const game = new Phaser.Game(config);
 let dog, cursors, cars, bonesGroup, rows, bestRow, hopping, gameOver, started;
 let introOpen, bones, slowUntil, hud, queued, swipeStart;
 let menuOpen = false, skinBtn = null, wObjs = [];
+let pauseOpen = false, pauseBtn = null, frozen = false, freezeAt = 0;
 let seenIntro = false;
 
 // ---------- Huesitos acumulados (todas las partidas) ----------
@@ -58,12 +60,170 @@ function saveSkins() {
 let skinData = loadSkins();
 function balance() { return Math.max(totalBones - skinData.spent, 0); }   // huesitos disponibles
 
+// ---------- Ajustes (sonidos, música y vibración) ----------
+function loadSettings() {
+  const s = { sound: true, music: true, vibration: true };
+  try {
+    const d = JSON.parse(localStorage.getItem(SETTINGS_KEY));
+    if (d && typeof d === 'object') {
+      s.sound = d.sound !== false;
+      s.music = d.music !== false;
+      s.vibration = d.vibration !== false;
+    }
+  } catch (e) {}
+  return s;
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) {}
+}
+let settings = loadSettings();
+
 function rowY(r) { return HEIGHT - TILE * (r + 1) + TILE / 2; }
 function colX(c) { return c * TILE + TILE / 2; }
 function score() { return bestRow - START_ROW; }
 function level() { return 1 + Math.floor(score() / 10); }
 function speedMult() { return Math.min(0.5 + score() * 0.025, 1.8); }
 function scrollSpeed() { return Math.min(18 + score() * 0.45, 60); }
+
+// ===================== AUDIO (generado por código, sin archivos) =====================
+function ctxOf(scene) {
+  const m = scene && scene.sound;
+  return (m && m.context) ? m.context : null;
+}
+
+// Un "pitido" de oscilador. slide = frecuencia final (opcional).
+function voice(ctx, dest, freq, start, dur, type, vol, slide) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, start);
+  if (slide) o.frequency.exponentialRampToValueAtTime(slide, start + dur);
+  g.gain.setValueAtTime(vol || 0.1, start);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  o.connect(g);
+  g.connect(dest);
+  o.start(start);
+  o.stop(start + dur + 0.02);
+}
+
+// Ruido filtrado (choques, platillos)
+let noiseBuf = null;
+function noiseBuffer(ctx) {
+  if (!noiseBuf) {
+    const len = Math.floor(ctx.sampleRate * 0.5);
+    noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  }
+  return noiseBuf;
+}
+function noiseHit(ctx, dest, start, dur, vol, ftype, ffreq) {
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx);
+  const f = ctx.createBiquadFilter();
+  f.type = ftype;
+  f.frequency.value = ffreq;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(vol, start);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  src.connect(f);
+  f.connect(g);
+  g.connect(dest);
+  src.start(start);
+  src.stop(start + dur + 0.02);
+}
+
+// Efectos de sonido
+function sfx(scene, name) {
+  const ctx = ctxOf(scene);
+  if (!ctx || !settings.sound) return;
+  if (ctx.state === 'suspended') ctx.resume();
+  const d = ctx.destination;
+  const t = ctx.currentTime;
+  switch (name) {
+    case 'hop':
+      voice(ctx, d, 520, t, 0.07, 'square', 0.07, 780); break;
+    case 'click':
+      voice(ctx, d, 660, t, 0.05, 'square', 0.06); break;
+    case 'bone':
+      voice(ctx, d, 988, t, 0.07, 'square', 0.08);
+      voice(ctx, d, 1319, t + 0.07, 0.12, 'square', 0.08); break;
+    case 'buy':
+      voice(ctx, d, 988, t, 0.06, 'square', 0.08);
+      voice(ctx, d, 1319, t + 0.06, 0.14, 'square', 0.08); break;
+    case 'nope':
+      voice(ctx, d, 200, t, 0.15, 'square', 0.08, 140); break;
+    case 'pothole':
+      voice(ctx, d, 170, t, 0.2, 'sawtooth', 0.12, 70);
+      noiseHit(ctx, d, t, 0.12, 0.08, 'lowpass', 500); break;
+    case 'crash':
+      noiseHit(ctx, d, t, 0.35, 0.2, 'lowpass', 1400);
+      voice(ctx, d, 260, t, 0.35, 'sawtooth', 0.12, 60);
+      voice(ctx, d, 392, t + 0.05, 0.3, 'square', 0.06);       // claxon
+      voice(ctx, d, 494, t + 0.05, 0.3, 'square', 0.06); break;
+    case 'scenario':
+      [523, 659, 784, 1047].forEach((f, i) => voice(ctx, d, f, t + i * 0.09, 0.14, 'square', 0.07)); break;
+    case 'win':
+      [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => voice(ctx, d, f, t + i * 0.11, 0.2, 'square', 0.08)); break;
+    case 'lose':
+      voice(ctx, d, 400, t, 0.5, 'triangle', 0.12, 110); break;
+  }
+}
+
+// Vibración (solo en dispositivos que la soportan)
+function vibrate(pattern) {
+  if (!settings.vibration) return;
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) {}
+}
+
+// Música: melodía alegre y juguetona en Do mayor (Do - Lam - Fa - Sol),
+// con bajo, bombo, platillo y una campanita tipo estrella.
+const BPM = 138;
+const STEP = 60 / BPM / 2;                        // corchea
+const MEL = [
+  72, 0, 76, 0, 79, 76, 72, 0,                    // C
+  69, 0, 72, 0, 76, 72, 69, 0,                    // Am
+  65, 0, 69, 0, 72, 69, 65, 0,                    // F
+  67, 0, 71, 0, 74, 71, 79, 0                     // G
+];
+const ROOTS = [48, 45, 41, 43];                   // bajo: C, A, F, G
+const SPARK = [91, 88, 93, 86];                   // campanita por compás
+let musicGain = null, musicTimer = null, nextNote = 0, musicStep = 0;
+
+function midi(n) { return 440 * Math.pow(2, (n - 69) / 12); }
+
+function startMusic(scene) {
+  const ctx = ctxOf(scene);
+  if (!ctx || !settings.music || musicTimer) return;
+  if (ctx.state === 'suspended') ctx.resume();
+  if (!musicGain) {
+    musicGain = ctx.createGain();
+    musicGain.gain.value = 0.7;
+    musicGain.connect(ctx.destination);
+  }
+  nextNote = ctx.currentTime + 0.1;
+  musicTimer = setInterval(() => musicTick(ctx), 80);
+}
+function stopMusic() {
+  if (musicTimer) { clearInterval(musicTimer); musicTimer = null; }
+}
+function musicTick(ctx) {
+  if (nextNote < ctx.currentTime - 0.3) nextNote = ctx.currentTime + 0.05;   // si la pestaña estuvo en segundo plano
+  while (nextNote < ctx.currentTime + 0.3) {
+    playStep(ctx, musicStep, nextNote);
+    nextNote += STEP;
+    musicStep = (musicStep + 1) % 32;
+  }
+}
+function playStep(ctx, s, t) {
+  const d = musicGain;
+  const bar = Math.floor(s / 8);
+  if (MEL[s]) voice(ctx, d, midi(MEL[s]), t, STEP * 1.6, 'square', 0.05);
+  if (s % 2 === 0) voice(ctx, d, midi(ROOTS[bar] + (s % 4 === 0 ? 0 : 7)), t, STEP * 1.7, 'triangle', 0.12);
+  if (s % 4 === 0) voice(ctx, d, 150, t, 0.1, 'sine', 0.18, 45);
+  if (s % 2 === 1) noiseHit(ctx, d, t, 0.04, 0.035, 'highpass', 7000);
+  if (s % 8 === 3) voice(ctx, d, midi(SPARK[bar]), t, 0.25, 'sine', 0.035);
+}
 
 // ===================== ESCENARIOS =====================
 const SCENARIOS = [
@@ -289,7 +449,10 @@ function create() {
   queued = null;
   swipeStart = null;
   menuOpen = false;
+  pauseOpen = false;
+  frozen = false;
   skinBtn = null;
+  pauseBtn = null;
   wObjs = [];
   introOpen = !seenIntro;
 
@@ -302,6 +465,15 @@ function create() {
   dog.body.setSize(20, 20);
 
   cursors = this.input.keyboard.createCursorKeys();
+
+  // Pausa con ESC o P
+  const togglePause = () => {
+    if (introOpen || gameOver) return;
+    if (pauseOpen) closePause(this);
+    else if (!menuOpen) openPause(this);
+  };
+  this.input.keyboard.on('keydown-ESC', togglePause);
+  this.input.keyboard.on('keydown-P', togglePause);
 
   // Controles táctiles: tocar = adelante, deslizar = hacia ese lado
   this.input.on('pointerdown', (p, over) => {
@@ -331,6 +503,8 @@ function create() {
     totalBones++;
     saveTotal();
     updateHud();
+    sfx(this, 'bone');
+    vibrate(20);
   });
 
   if (introOpen) showIntro(this); else afterIntro(this);
@@ -343,8 +517,26 @@ function updateHud() {
 }
 
 function afterIntro(scene) {
+  makePauseBtn(scene);
   makeSkinBtn(scene);
+  startMusic(scene);
   showBanner(scene, SCENARIOS[0]);
+}
+
+// Congela el juego mientras hay un menú abierto
+function freeze(scene) {
+  if (frozen) return;
+  frozen = true;
+  freezeAt = scene.time.now;
+  scene.physics.pause();
+  scene.tweens.pauseAll();
+}
+function unfreeze(scene) {
+  if (!frozen) return;
+  frozen = false;
+  if (slowUntil) slowUntil += scene.time.now - freezeAt;   // el bache no se acaba durante la pausa
+  if (!gameOver) scene.physics.resume();
+  scene.tweens.resumeAll();
 }
 
 // Espera ESPACIO o un toque en la pantalla
@@ -358,10 +550,12 @@ function onContinue(scene, fn, delay) {
 }
 
 function makeButton(scene, x, y, label, color, size) {
-  return scene.add.text(x, y, label, {
+  const b = scene.add.text(x, y, label, {
     fontSize: (size || 22) + 'px', color: '#ffffff', backgroundColor: color,
     padding: { x: 14, y: 8 }
   }).setOrigin(0.5).setScrollFactor(0).setInteractive({ useHandCursor: true });
+  b.on('pointerup', () => sfx(scene, 'click'));
+  return b;
 }
 
 // ---------- Narrativa ----------
@@ -377,6 +571,7 @@ function showIntro(scene) {
     'Huele su rastro y cruzará todo el país para encontrarlos. 🐶\n\n' +
     'Flechas del teclado o desliza el dedo para saltar.\n\n' +
     'Junta huesitos 🦴 y úsalos para desbloquear skins.\n\n' +
+    'ESC o el botón ⏸ para pausar.\n\n' +
     'Presiona ESPACIO o toca la pantalla para empezar',
     { fontSize: '20px', color: '#f4f4f0', align: 'center', lineSpacing: 4,
       wordWrap: { width: WIDTH - 60 } })
@@ -384,6 +579,7 @@ function showIntro(scene) {
   onContinue(scene, () => {
     bg.destroy(); title.destroy(); t.destroy();
     seenIntro = true; introOpen = false;
+    sfx(scene, 'click');
     afterIntro(scene);
   });
 }
@@ -403,22 +599,108 @@ function floatText(scene, msg) {
   scene.tweens.add({ targets: t, y: t.y - 40, alpha: 0, duration: 900, onComplete: () => t.destroy() });
 }
 
-// ---------- Botón de skins (antes del primer salto) ----------
+// ---------- Botones superiores ----------
+function makePauseBtn(scene) {
+  pauseBtn = makeButton(scene, WIDTH - 30, 34, '⏸', '#475569', 22).setDepth(10);
+  pauseBtn.on('pointerup', () => {
+    if (introOpen || gameOver || menuOpen) return;
+    openPause(scene);
+  });
+}
+
+// Botón de skins (solo antes del primer salto)
 function makeSkinBtn(scene) {
-  skinBtn = makeButton(scene, WIDTH - 62, 34, '👗 Skins', '#7c3aed', 18).setDepth(10);
+  skinBtn = makeButton(scene, WIDTH - 112, 34, '👗 Skins', '#7c3aed', 18).setDepth(10);
   skinBtn.on('pointerup', () => openWardrobe(scene));
+}
+
+// ---------- Menú de pausa ----------
+function openPause(scene) {
+  if (menuOpen) return;
+  pauseOpen = true;
+  menuOpen = true;
+  freeze(scene);
+  renderPause(scene);
+}
+
+function closePause(scene) {
+  wObjs.forEach(o => o.destroy());
+  wObjs = [];
+  pauseOpen = false;
+  menuOpen = false;
+  unfreeze(scene);
+}
+
+function renderPause(scene) {
+  wObjs.forEach(o => o.destroy());
+  wObjs = [];
+  const add = o => { o.setScrollFactor(0); wObjs.push(o); return o; };
+  const later = fn => () => scene.time.delayedCall(0, fn);
+
+  add(scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x0f172a, 0.96)
+    .setDepth(30).setInteractive());
+  add(scene.add.text(WIDTH / 2, 110, '⏸ PAUSA', {
+    fontSize: '34px', color: '#ffe066', fontStyle: 'bold'
+  }).setOrigin(0.5).setDepth(31));
+  add(scene.add.text(WIDTH / 2, 160, 'Puntos: ' + score() + '   🦴 ' + bones, {
+    fontSize: '20px', color: '#ffffff'
+  }).setOrigin(0.5).setDepth(31));
+
+  const btn = (y, label, color, fn) => {
+    const b = add(makeButton(scene, WIDTH / 2, y, label, color, 24).setDepth(31));
+    b.on('pointerup', later(fn));
+  };
+  const onOff = v => (v ? 'SÍ' : 'NO');
+  const col = v => (v ? '#1e88e5' : '#475569');
+
+  btn(250, '▶ Continuar', '#2e7d32', () => closePause(scene));
+
+  btn(340, '🔊 Sonidos: ' + onOff(settings.sound), col(settings.sound), () => {
+    settings.sound = !settings.sound;
+    saveSettings();
+    if (settings.sound) sfx(scene, 'click');
+    renderPause(scene);
+  });
+
+  btn(410, '🎵 Música: ' + onOff(settings.music), col(settings.music), () => {
+    settings.music = !settings.music;
+    saveSettings();
+    if (settings.music) startMusic(scene); else stopMusic();
+    renderPause(scene);
+  });
+
+  btn(480, '📳 Vibración: ' + onOff(settings.vibration), col(settings.vibration), () => {
+    settings.vibration = !settings.vibration;
+    saveSettings();
+    vibrate(60);
+    renderPause(scene);
+  });
+
+  if (!navigator.vibrate) {
+    add(scene.add.text(WIDTH / 2, 530, 'Este dispositivo no soporta vibración.', {
+      fontSize: '15px', color: '#94a3b8', align: 'center'
+    }).setOrigin(0.5).setDepth(31));
+  }
+
+  btn(610, '↺ Reiniciar partida', '#b45309', () => {
+    closePause(scene);
+    scene.scene.restart();
+  });
 }
 
 // ---------- Armario ----------
 function openWardrobe(scene) {
+  if (menuOpen) return;
   menuOpen = true;
+  freeze(scene);
   renderWardrobe(scene, '');
 }
 
-function closeWardrobe() {
+function closeWardrobe(scene) {
   wObjs.forEach(o => o.destroy());
   wObjs = [];
   menuOpen = false;
+  unfreeze(scene);
 }
 
 function renderWardrobe(scene, msg) {
@@ -460,6 +742,7 @@ function renderWardrobe(scene, msg) {
       let text = '';
       if (!owned) {
         if (balance() < s.cost) {
+          sfx(scene, 'nope');
           text = 'Te faltan ' + (s.cost - balance()) + ' huesitos para ' + s.name;
           scene.time.delayedCall(0, () => renderWardrobe(scene, text));
           return;
@@ -467,6 +750,9 @@ function renderWardrobe(scene, msg) {
         skinData.spent += s.cost;
         skinData.owned.push(s.id);
         text = '¡Desbloqueaste ' + s.name + '!';
+        sfx(scene, 'buy');
+      } else {
+        sfx(scene, 'click');
       }
       skinData.selected = s.id;
       saveSkins();
@@ -480,11 +766,12 @@ function renderWardrobe(scene, msg) {
   }).setOrigin(0.5).setDepth(31));
 
   const close = add(makeButton(scene, WIDTH / 2, 676, '✖ Cerrar', '#475569', 20).setDepth(31));
-  close.on('pointerup', () => scene.time.delayedCall(0, closeWardrobe));
+  close.on('pointerup', () => scene.time.delayedCall(0, () => closeWardrobe(scene)));
 }
 
 // ---------- Pantalla final ----------
 function endScreen(scene, msg) {
+  if (pauseBtn) { pauseBtn.destroy(); pauseBtn = null; }
   scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x0f172a, 0.85)
     .setScrollFactor(0).setDepth(20);
   scene.add.text(WIDTH / 2, HEIGHT / 2 - 70,
@@ -507,6 +794,8 @@ function win(scene) {
   if (gameOver) return;
   gameOver = true;
   scene.physics.pause();
+  sfx(scene, 'win');
+  vibrate([60, 40, 60, 40, 120]);
   endScreen(scene, '¡Luna encontró a su familia en Galápagos! 🐶❤️\n\nFIN');
 }
 
@@ -514,6 +803,8 @@ function caught(scene) {
   if (gameOver) return;
   gameOver = true;
   scene.physics.pause();
+  sfx(scene, 'lose');
+  vibrate(150);
   endScreen(scene, '¡Te quedaste atrás!\nLuna perdió el rastro...');
 }
 
@@ -522,6 +813,8 @@ function hitCar() {
   gameOver = true;
   this.physics.pause();
   dog.setTint(0xff6666).setScale(1.3, 0.4);
+  sfx(this, 'crash');
+  vibrate(250);
   endScreen(this, '¡Oh no!\nLuna se perdió otra vez...');
 }
 
@@ -603,6 +896,7 @@ function hop(scene, dx, dy) {
   hopping = true;
   started = true;
   if (skinBtn) { skinBtn.destroy(); skinBtn = null; }   // ya empezó la partida
+  sfx(scene, 'hop');
   const slow = scene.time.now < slowUntil;
   scene.tweens.add({
     targets: dog, x: nx, y: ny, duration: slow ? 300 : 110, ease: 'Quad.easeOut',
@@ -614,7 +908,10 @@ function hop(scene, dx, dy) {
     updateHud();
     while (rows.length < row + 28) addRow(scene, rows.length);
     const s = score();
-    if (s > 0 && s % SCEN_LEN === 0 && s < WIN_SCORE) showBanner(scene, scenarioOf(row));
+    if (s > 0 && s % SCEN_LEN === 0 && s < WIN_SCORE) {
+      showBanner(scene, scenarioOf(row));
+      sfx(scene, 'scenario');
+    }
     if (s >= WIN_SCORE) win(scene);
   }
 }
@@ -625,6 +922,8 @@ function checkPothole(scene, row, col) {
     slowUntil = scene.time.now + 3000;
     dog.setTint(0xb5a37a);
     floatText(scene, '¡Bache!');
+    sfx(scene, 'pothole');
+    vibrate(80);
   }
 }
 
